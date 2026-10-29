@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>迷路生成 BFS/DFS 可視化</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #111827; }
+  canvas { display: block; border-radius: 8px; }
+  #mazeCanvas { background: #1f2937; }
+</style>
+</head>
+<body class="min-h-screen flex flex-col items-center py-4 px-2">
+
+<h1 class="text-white text-xl font-black mb-3">迷路生成 BFS/DFS 可視化</h1>
+
+<!-- Controls -->
+<div class="flex gap-2 mb-3 flex-wrap justify-center">
+  <div class="flex items-center gap-1">
+    <label for="sizeSelect" class="text-gray-300 text-sm">サイズ:</label>
+    <select id="sizeSelect" class="bg-gray-700 text-white rounded px-2 py-1 text-sm" aria-label="迷路サイズ">
+      <option value="10">10×10</option>
+      <option value="20" selected>20×20</option>
+      <option value="30">30×30</option>
+    </select>
+  </div>
+  <div class="flex items-center gap-1">
+    <label for="speedRange" class="text-gray-300 text-sm">速度:</label>
+    <input id="speedRange" type="range" min="1" max="10" value="5" class="w-20" aria-label="アニメ速度">
+  </div>
+  <button id="generateBtn" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded font-bold text-sm" tabindex="0" aria-label="迷路を生成">生成</button>
+  <button id="solveBtn"    class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded font-bold text-sm hidden" tabindex="0" aria-label="最短経路を表示">最短経路</button>
+  <button id="playBtn"     class="bg-yellow-500 hover:bg-yellow-600 text-white px-3 py-1.5 rounded font-bold text-sm hidden" tabindex="0" aria-label="手動プレイモード">手動プレイ</button>
+</div>
+
+<canvas id="mazeCanvas" role="application" aria-label="迷路キャンバス"></canvas>
+
+<div id="statusEl" role="status" aria-live="polite" class="text-gray-300 text-sm mt-2 h-5"></div>
+<div class="text-gray-500 text-xs mt-1">手動プレイ中: 矢印キーで移動</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('mazeCanvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('statusEl');
+
+  let COLS = 20, ROWS = 20;
+  let CELL = 20;
+  let maze = null; // 2D array of {walls: [N,E,S,W], visited}
+  let phase = 'idle'; // 'idle' | 'generating' | 'solving' | 'done' | 'playing'
+  let animId = null;
+  let player = {x: 0, y: 0};
+  let playerTrail = [];
+  let path = []; // BFS solution path
+  let genStack = [];
+  let genVisited = null;
+  let genCurrent = null;
+  let solveQueue = [];
+  let solvePrev = null;
+  let solveVisited = null;
+
+  function getSpeed() { return 11 - parseInt(document.getElementById('speedRange').value); }
+
+  function initMaze() {
+    maze = Array.from({length: ROWS}, () =>
+      Array.from({length: COLS}, () => ({walls: [true,true,true,true], visited: false}))
+    );
+  }
+
+  // DFS generation: walls [N=0, E=1, S=2, W=3]
+  const DX = [0,1,0,-1], DY = [-1,0,1,0];
+  function opposite(d) { return (d + 2) % 4; }
+
+  function startGeneration() {
+    initMaze();
+    genStack = [{x:0, y:0}];
+    maze[0][0].visited = true;
+    genCurrent = {x:0, y:0};
+    genVisited = 1;
+    phase = 'generating';
+    path = [];
+    player = {x:0, y:0};
+    playerTrail = [];
+    document.getElementById('solveBtn').classList.add('hidden');
+    document.getElementById('playBtn').classList.add('hidden');
+    setStatus('迷路を生成中...');
+  }
+
+  function stepGenerate(steps) {
+    for (let s = 0; s < steps; s++) {
+      if (genStack.length === 0) {
+        phase = 'done';
+        document.getElementById('solveBtn').classList.remove('hidden');
+        document.getElementById('playBtn').classList.remove('hidden');
+        setStatus('生成完了！「最短経路」か「手動プレイ」を選んでください。');
+        return;
+      }
+      const cur = genStack[genStack.length - 1];
+      // Find unvisited neighbors
+      const dirs = [0,1,2,3].filter(d => {
+        const nx = cur.x + DX[d], ny = cur.y + DY[d];
+        return nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS && !maze[ny][nx].visited;
+      });
+      if (dirs.length === 0) {
+        genStack.pop();
+      } else {
+        const d = dirs[Math.floor(Math.random() * dirs.length)];
+        const nx = cur.x + DX[d], ny = cur.y + DY[d];
+        maze[cur.y][cur.x].walls[d] = false;
+        maze[ny][nx].walls[opposite(d)] = false;
+        maze[ny][nx].visited = true;
+        genCurrent = {x: nx, y: ny};
+        genStack.push(genCurrent);
+      }
+    }
+  }
+
+  // BFS solve
+  function startSolve() {
+    phase = 'solving';
+    const target = {x: COLS-1, y: ROWS-1};
+    solveQueue = [{x:0, y:0}];
+    solvePrev = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+    solveVisited = Array.from({length: ROWS}, () => Array(COLS).fill(false));
+    solveVisited[0][0] = true;
+    setStatus('BFSで最短経路を探索中...');
+  }
+
+  function stepSolve(steps) {
+    const target = {x: COLS-1, y: ROWS-1};
+    for (let s = 0; s < steps; s++) {
+      if (solveQueue.length === 0) {
+        phase = 'done';
+        setStatus('経路が見つかりません');
+        return;
+      }
+      const cur = solveQueue.shift();
+      if (cur.x === target.x && cur.y === target.y) {
+        // Reconstruct path
+        path = [];
+        let c = cur;
+        while (c) {
+          path.unshift(c);
+          c = solvePrev[c.y][c.x];
+        }
+        phase = 'done';
+        setStatus(`最短経路: ${path.length} ステップ`);
+        return;
+      }
+      for (let d = 0; d < 4; d++) {
+        if (maze[cur.y][cur.x].walls[d]) continue;
+        const nx = cur.x + DX[d], ny = cur.y + DY[d];
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        if (solveVisited[ny][nx]) continue;
+        solveVisited[ny][nx] = true;
+        solvePrev[ny][nx] = cur;
+        solveQueue.push({x: nx, y: ny});
+      }
+    }
+  }
+
+  // ── Rendering ──
+  function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#1f2937';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const C = CELL;
+    // BFS visited overlay
+    if ((phase === 'solving' || phase === 'done') && solveVisited) {
+      for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+          if (solveVisited[y][x]) {
+            ctx.fillStyle = 'rgba(59,130,246,0.2)';
+            ctx.fillRect(x * C + 1, y * C + 1, C - 2, C - 2);
+          }
+        }
+      }
+    }
+
+    // Solution path
+    if (path.length > 0) {
+      ctx.fillStyle = 'rgba(34,197,94,0.7)';
+      path.forEach(p => ctx.fillRect(p.x * C + 2, p.y * C + 2, C - 4, C - 4));
+    }
+
+    // Player trail
+    playerTrail.forEach(p => {
+      ctx.fillStyle = 'rgba(251,191,36,0.3)';
+      ctx.fillRect(p.x * C + 2, p.y * C + 2, C - 4, C - 4);
+    });
+
+    // DFS current cell
+    if (phase === 'generating' && genCurrent) {
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(genCurrent.x * C + 1, genCurrent.y * C + 1, C - 2, C - 2);
+    }
+
+    // Maze walls
+    ctx.strokeStyle = '#6b7280';
+    ctx.lineWidth = 1;
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        const cell = maze[y][x];
+        const px = x * C, py = y * C;
+        ctx.beginPath();
+        if (cell.walls[0]) { ctx.moveTo(px, py); ctx.lineTo(px + C, py); }        // N
+        if (cell.walls[1]) { ctx.moveTo(px + C, py); ctx.lineTo(px + C, py + C); } // E
+        if (cell.walls[2]) { ctx.moveTo(px, py + C); ctx.lineTo(px + C, py + C); } // S
+        if (cell.walls[3]) { ctx.moveTo(px, py); ctx.lineTo(px, py + C); }         // W
+        ctx.stroke();
+      }
+    }
+
+    // Start / Goal
+    ctx.fillStyle = '#22c55e';
+    ctx.fillRect(2, 2, C - 4, C - 4);
+    ctx.fillStyle = '#ef4444';
+    ctx.fillRect((COLS-1) * C + 2, (ROWS-1) * C + 2, C - 4, C - 4);
+
+    // Player
+    if (phase === 'playing') {
+      ctx.fillStyle = '#fbbf24';
+      ctx.beginPath();
+      ctx.arc(player.x * C + C/2, player.y * C + C/2, C/2 - 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ── Animation loop ──
+  let frameCount = 0;
+  function loop() {
+    frameCount++;
+    const speed = getSpeed();
+    const stepsPerFrame = Math.max(1, Math.ceil((11 - speed) * 0.5));
+
+    if (phase === 'generating') {
+      stepGenerate(stepsPerFrame * 2);
+    } else if (phase === 'solving') {
+      stepSolve(stepsPerFrame * 3);
+    }
+    render();
+    if (phase !== 'idle') {
+      animId = requestAnimationFrame(loop);
+    } else {
+      render();
+    }
+  }
+
+  function startLoop() {
+    if (animId) cancelAnimationFrame(animId);
+    animId = requestAnimationFrame(loop);
+  }
+  function stopLoop() {
+    if (animId) cancelAnimationFrame(animId);
+    animId = null;
+  }
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  // ── Canvas setup ──
+  function setupCanvas() {
+    COLS = parseInt(document.getElementById('sizeSelect').value);
+    ROWS = COLS;
+    CELL = Math.floor(Math.min(500, window.innerWidth - 32) / COLS);
+    canvas.width  = COLS * CELL;
+    canvas.height = ROWS * CELL;
+  }
+
+  // ── Buttons ──
+  document.getElementById('generateBtn').addEventListener('click', () => {
+    stopLoop();
+    setupCanvas();
+    startGeneration();
+    phase = 'generating';
+    startLoop();
+  });
+  document.getElementById('solveBtn').addEventListener('click', () => {
+    stopLoop();
+    startSolve();
+    startLoop();
+  });
+  document.getElementById('playBtn').addEventListener('click', () => {
+    stopLoop();
+    path = [];
+    player = {x: 0, y: 0};
+    playerTrail = [];
+    phase = 'playing';
+    setStatus('矢印キーでゴール（右下）を目指してください！');
+    render();
+  });
+
+  ['generateBtn','solveBtn','playBtn'].forEach(id => {
+    document.getElementById(id).addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); document.getElementById(id).click(); }
+    });
+  });
+
+  // ── Keyboard play ──
+  document.addEventListener('keydown', e => {
+    if (phase !== 'playing') return;
+    const map = { ArrowUp:0, ArrowRight:1, ArrowDown:2, ArrowLeft:3 };
+    const d = map[e.key];
+    if (d === undefined) return;
+    e.preventDefault();
+    if (maze[player.y][player.x].walls[d]) return;
+    playerTrail.push({...player});
+    player.x += DX[d]; player.y += DY[d];
+    if (player.x === COLS-1 && player.y === ROWS-1) {
+      setStatus(`クリア！ ${playerTrail.length + 1} ステップ`);
+      phase = 'done';
+    }
+    render();
+  });
+
+  // ── Settings persistence ──
+  const STORAGE_KEY = 'maze_viz_v1';
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        size: document.getElementById('sizeSelect').value,
+        speed: document.getElementById('speedRange').value,
+      }));
+    } catch(e) {}
+  }
+  function loadSettings() {
+    try {
+      const d = localStorage.getItem(STORAGE_KEY);
+      if (!d) return;
+      const s = JSON.parse(d);
+      if (s.size) document.getElementById('sizeSelect').value = s.size;
+      if (s.speed) document.getElementById('speedRange').value = s.speed;
+    } catch(e) {}
+  }
+  document.getElementById('sizeSelect').addEventListener('change', saveSettings);
+  document.getElementById('speedRange').addEventListener('change', saveSettings);
+
+  // ── Init ──
+  loadSettings();
+  setupCanvas();
+  initMaze();
+  render();
+  setStatus('「生成」ボタンで迷路を作成します。');
+})();
+</script>
+</body>
+</html>
